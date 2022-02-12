@@ -2,7 +2,7 @@ import pickle
 import types
 from collections import namedtuple
 from functools import partial
-from operator import add, setitem
+from operator import add, matmul, setitem
 from random import random
 
 import cloudpickle
@@ -15,11 +15,6 @@ from dask import compute
 from dask.delayed import Delayed, delayed, to_task_dask
 from dask.highlevelgraph import HighLevelGraph
 from dask.utils_test import inc
-
-try:
-    from operator import matmul
-except ImportError:
-    matmul = None
 
 
 class Tuple:
@@ -128,7 +123,7 @@ def test_operators():
     assert (1 + a).compute() == 11
     assert (a >> 1).compute() == 5
     assert (a > 2).compute()
-    assert (a ** 2).compute() == 100
+    assert (a**2).compute() == 100
 
     if matmul:
 
@@ -224,6 +219,9 @@ def test_delayed_optimize():
     (x2,) = dask.optimize(x)
     # Delayed's __dask_optimize__ culls out 'c'
     assert sorted(x2.dask.keys()) == ["a", "b"]
+    assert x2._layer != x2._key
+    # Optimize generates its own layer name, which doesn't match the key.
+    # `Delayed._rebuild` handles this.
 
 
 def test_lists():
@@ -702,17 +700,13 @@ def test_dask_layers():
     assert d2.dask.dependencies == {d1.key: set(), d2.key: {d1.key}}
     assert d2.__dask_layers__() == (d2.key,)
 
+    hlg = HighLevelGraph.from_collections("foo", {"alias": d2.key}, dependencies=[d2])
+    with pytest.raises(ValueError, match="not in"):
+        Delayed("alias", hlg)
 
-def test_dask_layers_to_delayed():
-    # da.Array.to_delayed squashes the dask graph and causes the layer name not to
-    # match the key
-    da = pytest.importorskip("dask.array")
-    d = da.ones(1).to_delayed()[0]
-    name = d.key[0]
-    assert d.key[1:] == (0,)
-    assert d.dask.layers.keys() == {"delayed-" + name}
-    assert d.dask.dependencies == {"delayed-" + name: set()}
-    assert d.__dask_layers__() == ("delayed-" + name,)
+    explicit = Delayed("alias", hlg, layer="foo")
+    assert explicit.__dask_layers__() == ("foo",)
+    explicit.dask.validate()
 
 
 def test_annotations_survive_optimization():

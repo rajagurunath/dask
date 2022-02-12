@@ -114,6 +114,19 @@ def sort_values(
             sort_function, **sort_function_kwargs
         )
 
+    if not isinstance(ascending, bool):
+        # support [True] as input
+        if (
+            isinstance(ascending, list)
+            and len(ascending) == 1
+            and isinstance(ascending[0], bool)
+        ):
+            ascending = ascending[0]
+        else:
+            raise NotImplementedError(
+                f"Dask currently only supports a single boolean for ascending. You passed {str(ascending)}"
+            )
+
     if (
         all(not pd.isna(x) for x in divisions)
         and mins == sorted(mins, reverse=not ascending)
@@ -320,7 +333,7 @@ def set_partition(
             column_dtype=df.columns.dtype,
         )
 
-    df4.divisions = methods.tolist(divisions)
+    df4.divisions = tuple(methods.tolist(divisions))
 
     return df4.map_partitions(M.sort_index)
 
@@ -666,7 +679,7 @@ def rearrange_by_column_tasks(
     else:
         k = n
 
-    inputs = [tuple(digit(i, j, k) for j in range(stages)) for i in range(k ** stages)]
+    inputs = [tuple(digit(i, j, k) for j in range(stages)) for i in range(k**stages)]
 
     npartitions_orig = df.npartitions
     token = tokenize(df, stages, column, n, k)
@@ -883,7 +896,7 @@ def shuffle_group(df, cols, stage, k, npartitions, ignore_index, nfinal):
     typ = np.min_scalar_type(npartitions * 2)
 
     c = np.mod(c, npartitions).astype(typ, copy=False)
-    np.floor_divide(c, k ** stage, out=c)
+    np.floor_divide(c, k**stage, out=c)
     np.mod(c, k, out=c)
 
     return group_split_dispatch(df, c, k, ignore_index=ignore_index)

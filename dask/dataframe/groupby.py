@@ -188,6 +188,19 @@ def _groupby_slice_transform(
     return g.transform(func, *args, **kwargs)
 
 
+def _groupby_slice_shift(
+    df, grouper, key, group_keys=True, dropna=None, observed=None, **kwargs
+):
+    # No need to use raise if unaligned here - this is only called after
+    # shuffling, which makes everything aligned already
+    dropna = {"dropna": dropna} if dropna is not None else {}
+    observed = {"observed": observed} if observed is not None else {}
+    g = df.groupby(grouper, group_keys=group_keys, **observed, **dropna)
+    if key:
+        g = g[key]
+    return g.shift(**kwargs)
+
+
 def _groupby_get_group(df, by_key, get_key, columns):
     # SeriesGroupBy may pass df which includes group key
     grouped = _groupby_raise_unaligned(df, by=by_key)
@@ -329,7 +342,7 @@ def _var_agg(g, levels, ddof, sort=False):
     n = g[g.columns[-nc // 3 :]].rename(columns=lambda c: c[0])
 
     # TODO: replace with _finalize_var?
-    result = x2 - x ** 2 / n
+    result = x2 - x**2 / n
     div = n - ddof
     div[div < 0] = 0
     result /= div
@@ -975,7 +988,7 @@ def _finalize_var(df, count_column, sum_column, sum2_column, ddof=1):
     x = df[sum_column]
     x2 = df[sum2_column]
 
-    result = x2 - x ** 2 / n
+    result = x2 - x**2 / n
     div = n - ddof
     div[div < 0] = 0
     result /= div
@@ -1092,7 +1105,7 @@ class _GroupBy:
             by_meta, group_keys=group_keys, **self.observed, **self.dropna
         )
 
-    @property
+    @property  # type: ignore
     @_deprecated()
     def index(self):
         return self.by
@@ -1218,7 +1231,7 @@ class _GroupBy:
         cumpart_ext = cumpart_raw_frame.assign(
             **{
                 i: self.obj[i]
-                if np.isscalar(i) and i in self.obj.columns
+                if np.isscalar(i) and i in getattr(self.obj, "columns", [])
                 else self.obj.index
                 for i in by
             }
@@ -1269,9 +1282,12 @@ class _GroupBy:
                 aggregate,
                 initial,
             )
-        graph = HighLevelGraph.from_collections(
-            name, dask, dependencies=[cumpart_raw, cumpart_ext, cumlast]
-        )
+
+        dependencies = [cumpart_raw]
+        if self.obj.npartitions > 1:
+            dependencies += [cumpart_ext, cumlast]
+
+        graph = HighLevelGraph.from_collections(name, dask, dependencies=dependencies)
         return new_dd_object(graph, name, chunk(self._meta), self.obj.divisions)
 
     def _shuffle(self, meta):
@@ -1643,9 +1659,10 @@ class _GroupBy:
 
            Pandas' groupby-apply can be used to to apply arbitrary functions,
            including aggregations that result in one row per group. Dask's
-           groupby-apply will apply ``func`` once to each partition-group pair,
-           so when ``func`` is a reduction you'll end up with one row per
-           partition-group pair. To apply a custom aggregation with Dask,
+           groupby-apply will apply ``func`` once on each group, doing a shuffle
+           if needed, such that each group is contained in one partition.
+           When ``func`` is a reduction, e.g., you'll end up with one row
+           per group. To apply a custom aggregation with Dask,
            use :class:`dask.dataframe.groupby.Aggregation`.
 
         Parameters
@@ -1728,9 +1745,10 @@ class _GroupBy:
 
            Pandas' groupby-transform can be used to to apply arbitrary functions,
            including aggregations that result in one row per group. Dask's
-           groupby-transform will apply ``func`` once to each partition-group pair,
-           so when ``func`` is a reduction you'll end up with one row per
-           partition-group pair. To apply a custom aggregation with Dask,
+           groupby-transform will apply ``func`` once on each group, doing a shuffle
+           if needed, such that each group is contained in one partition.
+           When ``func`` is a reduction, e.g., you'll end up with one row
+           per group. To apply a custom aggregation with Dask,
            use :class:`dask.dataframe.groupby.Aggregation`.
 
         Parameters
@@ -1797,6 +1815,95 @@ class _GroupBy:
         )
 
         return df3
+
+    @insert_meta_param_description(pad=12)
+    def shift(self, periods=1, freq=None, axis=0, fill_value=None, meta=no_default):
+        """Parallel version of pandas GroupBy.shift
+
+        This mimics the pandas version except for the following:
+
+        If the grouper does not align with the index then this causes a full
+        shuffle.  The order of rows within each group may not be preserved.
+
+        Parameters
+        ----------
+        periods : Delayed, Scalar or int, default 1
+            Number of periods to shift.
+        freq : Delayed, Scalar or str, optional
+            Frequency string.
+        axis : axis to shift, default 0
+            Shift direction.
+        fill_value : Scalar, Delayed or object, optional
+            The scalar value to use for newly introduced missing values.
+        $META
+
+        Returns
+        -------
+        shifted : Series or DataFrame shifted within each group.
+
+        Examples
+        --------
+        >>> import dask
+        >>> ddf = dask.datasets.timeseries(freq="1H")
+        >>> result = ddf.groupby("name").shift(1, meta={"id": int, "x": float, "y": float})
+        """
+        if meta is no_default:
+            with raise_on_meta_error("groupby.shift()", udf=False):
+                meta_kwargs = _extract_meta(
+                    {
+                        "periods": periods,
+                        "freq": freq,
+                        "axis": axis,
+                        "fill_value": fill_value,
+                    },
+                    nonempty=True,
+                )
+                meta = self._meta_nonempty.shift(**meta_kwargs)
+
+            msg = (
+                "`meta` is not specified, inferred from partial data. "
+                "Please provide `meta` if the result is unexpected.\n"
+                "  Before: .shift(1)\n"
+                "  After:  .shift(1, meta={'x': 'f8', 'y': 'f8'}) for dataframe result\n"
+                "  or:     .shift(1, meta=('x', 'f8'))            for series result"
+            )
+            warnings.warn(msg, stacklevel=2)
+
+        meta = make_meta(meta, parent_meta=self._meta.obj)
+
+        # Validate self.by
+        if isinstance(self.by, list) and any(
+            isinstance(item, Series) for item in self.by
+        ):
+            raise NotImplementedError(
+                "groupby-shift with a multiple Series is currently not supported"
+            )
+        df = self.obj
+        should_shuffle = not (df.known_divisions and df._contains_index_name(self.by))
+
+        if should_shuffle:
+            df2, by = self._shuffle(meta)
+        else:
+            df2 = df
+            by = self.by
+
+        # Perform embarrassingly parallel groupby-shift
+        result = map_partitions(
+            _groupby_slice_shift,
+            df2,
+            by,
+            self._slice,
+            periods=periods,
+            freq=freq,
+            axis=axis,
+            fill_value=fill_value,
+            token="groupby-shift",
+            group_keys=self.group_keys,
+            meta=meta,
+            **self.observed,
+            **self.dropna,
+        )
+        return result
 
     def rolling(self, window, min_periods=None, center=False, win_type=None, axis=0):
         """Provides rolling transformations.

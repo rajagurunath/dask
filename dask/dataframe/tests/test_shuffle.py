@@ -4,6 +4,7 @@ import os
 import pickle
 import random
 import string
+import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from copy import copy
@@ -435,6 +436,10 @@ def test_set_index_divisions_sorted():
         ddf.set_index("y", divisions=["a", "b", "d", "c"], sorted=True)
 
 
+@pytest.mark.xfail(
+    sys.platform == "win32" and sys.version_info[:2] == (3, 7),
+    reason="https://github.com/dask/dask/issues/8549",
+)
 @pytest.mark.slow
 def test_set_index_consistent_divisions():
     # See https://github.com/dask/dask/issues/3867
@@ -583,7 +588,7 @@ def test_set_index_sorts():
         dfs.append(pd.DataFrame({"timestamp": vals[lo:hi]}, index=range(lo, hi)))
 
     ddf = dd.concat(dfs).clear_divisions()
-    assert ddf.set_index("timestamp").index.compute().is_monotonic is True
+    assert ddf.set_index("timestamp").index.compute().is_monotonic_increasing is True
 
 
 @pytest.mark.parametrize(
@@ -1243,10 +1248,13 @@ def test_sort_values(nelem, nparts, by, ascending):
     "data",
     [
         {
-            "a": list(range(50)) + [None] * 50 + list(range(50, 100)),
-            "b": [None] * 100 + list(range(100, 150)),
+            "a": list(range(50)) + [None] * 50 + list(range(50, 100)),  # type: ignore
+            "b": [None] * 100 + list(range(100, 150)),  # type: ignore
         },
-        {"a": list(range(15)) + [None] * 5, "b": list(reversed(range(20)))},
+        {
+            "a": list(range(15)) + [None] * 5,  # type: ignore
+            "b": list(reversed(range(20))),
+        },
     ],
 )
 def test_sort_values_with_nulls(data, nparts, by, ascending, na_position):
@@ -1276,3 +1284,12 @@ def test_sort_values_custom_function(by, nparts):
         )
     expect = df.sort_values(by=by)
     dd.assert_eq(got, expect, check_index=False)
+
+
+def test_sort_values_bool_ascending():
+    df = pd.DataFrame({"a": [1, 2, 3] * 20, "b": [4, 5, 6, 7] * 15})
+    ddf = dd.from_pandas(df, npartitions=10)
+
+    # attempt to sort with list of ascending booleans
+    with pytest.raises(NotImplementedError):
+        ddf.sort_values(by="a", ascending=[True, False])
